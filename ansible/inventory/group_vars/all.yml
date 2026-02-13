@@ -1,0 +1,138 @@
+---
+# Global Variables for Kubernetes Cluster Setup
+
+# ====================
+# Network Configuration
+# ====================
+# Virtual IP for control plane HA (must be available in your network)
+control_plane_vip: "192.168.1.100"  # UPDATE THIS
+control_plane_port: 6443
+
+# Pod network CIDR
+pod_network_cidr: "10.244.0.0/16"
+
+# Service network CIDR
+service_cidr: "10.96.0.0/12"
+
+# DNS domain
+cluster_dns_domain: "cluster.local"
+
+# Your domain for ingress (update this)
+base_domain: "k8s.local"  # UPDATE THIS (e.g., k8s.example.com)
+
+# ====================
+# Kubernetes Version
+# ====================
+kubernetes_version: "1.29"  # Latest stable
+kubernetes_version_full: "1.29.1-1.1"
+
+# ====================
+# Container Runtime
+# ====================
+containerd_version: "1.7.13"
+runc_version: "1.1.12"
+cni_plugins_version: "1.4.0"
+
+# ====================
+# HAProxy + Keepalived
+# ====================
+haproxy_stats_port: 9000
+haproxy_stats_user: admin
+haproxy_stats_password: "changeme"  # UPDATE THIS
+keepalived_interface: "eth0"  # UPDATE THIS to your network interface
+keepalived_router_id: 51
+keepalived_auth_pass: "changeme"  # UPDATE THIS
+
+# ====================
+# Cilium Configuration
+# ====================
+cilium_version: "1.15.1"
+cilium_cli_version: "0.15.22"
+enable_hubble: true
+enable_hubble_ui: true
+cilium_kube_proxy_replacement: true  # Use Cilium for kube-proxy
+
+# ====================
+# MetalLB Configuration
+# ====================
+metallb_version: "0.14.3"
+metallb_ip_range: "192.168.1.200-192.168.1.250"  # UPDATE THIS - IPs for LoadBalancer services
+
+# ====================
+# Storage Configuration
+# ====================
+storage_provisioner: "local-path"
+local_path_provisioner_version: "v0.0.26"
+local_path_storage_path: "/opt/local-path-provisioner"
+
+# ====================
+# Ingress Configuration
+# ====================
+ingress_nginx_version: "4.9.1"
+ingress_nginx_chart_version: "4.9.1"
+
+# ====================
+# cert-manager Configuration
+# ====================
+cert_manager_version: "v1.14.2"
+cert_manager_email: "admin@example.com"  # UPDATE THIS for Let's Encrypt
+
+# ====================
+# Monitoring Configuration
+# ====================
+kube_prometheus_stack_version: "56.6.2"
+prometheus_retention: "30d"
+prometheus_storage_size: "50Gi"
+grafana_admin_password: "changeme"  # UPDATE THIS
+
+# ====================
+# Harbor Configuration
+# ====================
+harbor_version: "2.10.0"
+harbor_chart_version: "1.14.0"
+harbor_admin_password: "changeme"  # UPDATE THIS
+harbor_storage_size: "100Gi"
+
+# ====================
+# System Configuration
+# ====================
+# Disable swap
+disable_swap: true
+
+# Configure firewall (set to false if managing manually)
+configure_firewall: true
+
+# SELinux mode (permissive or disabled for Kubernetes)
+selinux_mode: permissive
+
+# Timezone
+system_timezone: "UTC"
+
+# NTP servers
+ntp_servers:
+  - 0.pool.ntp.org
+  - 1.pool.ntp.org
+  - 2.pool.ntp.org
+
+# ====================
+# SSH Configuration
+# ====================
+# Control node user (where kubectl will be configured)
+control_user: "root"  # UPDATE THIS if using non-root user
+
+# ====================
+# Helm Configuration
+# ====================
+helm_version: "3.14.0"
+
+# ====================
+# Feature Flags
+# ====================
+# Enable/disable components
+install_monitoring: true
+install_harbor: true
+install_cert_manager: true
+install_ingress: true
+install_metallb: true
+install_storage: true
+install_cilium_hubble: true

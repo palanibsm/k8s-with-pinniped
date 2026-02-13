@@ -1,0 +1,118 @@
+---
+- name: Join Additional Master Nodes to Cluster
+  hosts: control_plane[1:]
+  become: yes
+  tasks:
+    - name: Check if node is already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Copy join command to master nodes
+      copy:
+        src: /tmp/join-command-control-plane.sh
+        dest: /tmp/join-command.sh
+        mode: '0755'
+      when: not kubelet_conf.stat.exists
+
+    - name: Join control plane node to cluster
+      shell: bash /tmp/join-command.sh
+      register: join_output
+      when: not kubelet_conf.stat.exists
+
+    - name: Display join output
+      debug:
+        var: join_output.stdout_lines
+      when: not kubelet_conf.stat.exists
+
+    - name: Create .kube directory for root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Copy admin.conf to root's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Create non-root user's .kube directory (if control_user is not root)
+      file:
+        path: "/home/{{ control_user }}/.kube"
+        state: directory
+        owner: "{{ control_user }}"
+        group: "{{ control_user }}"
+        mode: '0755'
+      when: control_user != "root"
+
+    - name: Copy admin.conf to non-root user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ control_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ control_user }}"
+        group: "{{ control_user }}"
+        mode: '0600'
+      when: control_user != "root"
+
+    - name: Wait for node to be ready
+      command: kubectl get nodes {{ node_name }}
+      register: node_status
+      retries: 30
+      delay: 10
+      until: node_status.rc == 0
+      changed_when: false
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+- name: Configure Additional Masters as Workers
+  hosts: control_plane[1:]
+  become: yes
+  tasks:
+    - name: Taint control plane nodes to allow workloads
+      command: kubectl taint nodes {{ node_name }} node-role.kubernetes.io/control-plane:NoSchedule-
+      register: taint_result
+      failed_when: false
+      changed_when: "'untainted' in taint_result.stdout"
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+    - name: Label control plane nodes as workers
+      command: kubectl label nodes {{ node_name }} node-role.kubernetes.io/worker=worker --overwrite
+      changed_when: false
+      delegate_to: "{{ groups['control_plane'][0] }}"
+
+- name: Verify All Masters Joined
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Get all nodes
+      command: kubectl get nodes
+      register: all_nodes
+      changed_when: false
+
+    - name: Display all nodes
+      debug:
+        var: all_nodes.stdout_lines
+
+    - name: Get control plane pods
+      command: kubectl get pods -n kube-system
+      register: control_plane_pods
+      changed_when: false
+
+    - name: Display control plane pods
+      debug:
+        var: control_plane_pods.stdout_lines
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "All Master Nodes Joined Successfully!"
+          - "==========================================="
+          - "Control plane is now highly available"
+          - "Masters: {{ groups['control_plane'] | length }}"
+          - "Next: Join worker nodes"
+          - "==========================================="

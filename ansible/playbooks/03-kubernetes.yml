@@ -1,0 +1,130 @@
+---
+- name: Install Kubernetes Components (kubeadm, kubelet, kubectl)
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    # Debian/Ubuntu Installation
+    - name: Add Kubernetes apt key (Debian/Ubuntu)
+      apt_key:
+        url: https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key
+        state: present
+        keyring: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      when: ansible_os_family == "Debian"
+
+    - name: Add Kubernetes apt repository (Debian/Ubuntu)
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+      when: ansible_os_family == "Debian"
+
+    - name: Update apt cache (Debian/Ubuntu)
+      apt:
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Install Kubernetes packages (Debian/Ubuntu)
+      apt:
+        name:
+          - "kubelet={{ kubernetes_version_full }}"
+          - "kubeadm={{ kubernetes_version_full }}"
+          - "kubectl={{ kubernetes_version_full }}"
+        state: present
+        allow_downgrade: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Hold Kubernetes packages at current version (Debian/Ubuntu)
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+      when: ansible_os_family == "Debian"
+
+    # RHEL/CentOS Installation
+    - name: Add Kubernetes yum repository (RHEL/CentOS)
+      yum_repository:
+        name: kubernetes
+        description: Kubernetes
+        baseurl: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/rpm/"
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/rpm/repodata/repomd.xml.key"
+        exclude: kubelet kubeadm kubectl cri-tools kubernetes-cni
+      when: ansible_os_family == "RedHat"
+
+    - name: Install Kubernetes packages (RHEL/CentOS)
+      yum:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        disable_excludes: kubernetes
+      when: ansible_os_family == "RedHat"
+
+    - name: Create kubelet service directory
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Configure kubelet to use node IP
+      copy:
+        dest: /etc/systemd/system/kubelet.service.d/20-node-ip.conf
+        content: |
+          [Service]
+          Environment="KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}"
+        mode: '0644'
+
+    - name: Enable kubelet service (do not start yet)
+      systemd:
+        name: kubelet
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Install crictl (Container Runtime Interface CLI)
+      get_url:
+        url: "https://github.com/kubernetes-sigs/cri-tools/releases/download/v{{ kubernetes_version }}.0/crictl-v{{ kubernetes_version }}.0-linux-amd64.tar.gz"
+        dest: /tmp/crictl.tar.gz
+        mode: '0644'
+
+    - name: Extract crictl
+      unarchive:
+        src: /tmp/crictl.tar.gz
+        dest: /usr/local/bin
+        remote_src: yes
+
+    - name: Configure crictl to use containerd
+      copy:
+        dest: /etc/crictl.yaml
+        content: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+          image-endpoint: unix:///run/containerd/containerd.sock
+          timeout: 10
+        mode: '0644'
+
+    - name: Verify kubeadm version
+      command: kubeadm version -o short
+      register: kubeadm_version_output
+      changed_when: false
+
+    - name: Display kubeadm version
+      debug:
+        msg: "kubeadm version: {{ kubeadm_version_output.stdout }}"
+
+    - name: Verify kubectl version
+      command: kubectl version --client -o yaml
+      register: kubectl_version_output
+      changed_when: false
+
+    - name: Display kubectl version
+      debug:
+        msg: "kubectl installed successfully"
+
+    - name: Clean up downloaded files
+      file:
+        path: /tmp/crictl.tar.gz
+        state: absent

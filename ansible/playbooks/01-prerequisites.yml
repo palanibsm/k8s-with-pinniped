@@ -1,0 +1,238 @@
+---
+- name: Configure Prerequisites for Kubernetes Cluster
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    - name: Set hostname
+      hostname:
+        name: "{{ node_name }}"
+
+    - name: Update /etc/hosts with all cluster nodes
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].node_ip }} {{ hostvars[item].node_name }}"
+        state: present
+      loop: "{{ groups['k8s_cluster'] }}"
+
+    - name: Add VIP to /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ control_plane_vip }} k8s-api k8s-api.{{ base_domain }}"
+        state: present
+
+    - name: Disable swap immediately
+      command: swapoff -a
+      when: disable_swap | bool
+
+    - name: Disable swap permanently in /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+      when: disable_swap | bool
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Enable kernel modules at boot
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Set sysctl parameters for Kubernetes
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+        sysctl_file: /etc/sysctl.d/k8s.conf
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+        - { name: 'net.ipv4.conf.all.forwarding', value: '1' }
+        - { name: 'net.ipv6.conf.all.forwarding', value: '1' }
+        - { name: 'vm.swappiness', value: '0' }
+
+    - name: Update apt cache (Debian/Ubuntu)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+
+    - name: Install required packages (Debian/Ubuntu)
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+          - net-tools
+          - wget
+          - git
+          - vim
+          - htop
+          - nfs-common
+          - chrony
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Install required packages (RHEL/CentOS)
+      yum:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - net-tools
+          - wget
+          - git
+          - vim
+          - htop
+          - nfs-utils
+          - chrony
+          - yum-utils
+          - device-mapper-persistent-data
+          - lvm2
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Disable SELinux (RHEL/CentOS)
+      selinux:
+        state: "{{ selinux_mode }}"
+      when: ansible_os_family == "RedHat" and ansible_selinux.status != "disabled"
+
+    - name: Configure firewalld (RHEL/CentOS)
+      block:
+        - name: Enable and start firewalld
+          systemd:
+            name: firewalld
+            enabled: yes
+            state: started
+
+        - name: Open Kubernetes ports on control plane nodes
+          firewalld:
+            port: "{{ item }}"
+            permanent: yes
+            state: enabled
+            immediate: yes
+          loop:
+            - 6443/tcp        # Kubernetes API
+            - 2379-2380/tcp   # etcd
+            - 10250/tcp       # kubelet
+            - 10251/tcp       # kube-scheduler
+            - 10252/tcp       # kube-controller-manager
+            - 10257/tcp       # kube-controller-manager secure
+            - 10259/tcp       # kube-scheduler secure
+          when: inventory_hostname in groups['control_plane']
+
+        - name: Open Kubernetes ports on all nodes
+          firewalld:
+            port: "{{ item }}"
+            permanent: yes
+            state: enabled
+            immediate: yes
+          loop:
+            - 10250/tcp       # kubelet
+            - 30000-32767/tcp # NodePort range
+
+        - name: Enable masquerading
+          firewalld:
+            masquerade: yes
+            permanent: yes
+            state: enabled
+            immediate: yes
+      when: ansible_os_family == "RedHat" and configure_firewall | bool
+
+    - name: Configure UFW (Ubuntu)
+      block:
+        - name: Allow SSH
+          ufw:
+            rule: allow
+            port: '22'
+            proto: tcp
+
+        - name: Allow Kubernetes API (control plane)
+          ufw:
+            rule: allow
+            port: '6443'
+            proto: tcp
+          when: inventory_hostname in groups['control_plane']
+
+        - name: Allow etcd (control plane)
+          ufw:
+            rule: allow
+            port: '2379:2380'
+            proto: tcp
+          when: inventory_hostname in groups['control_plane']
+
+        - name: Allow kubelet
+          ufw:
+            rule: allow
+            port: '10250'
+            proto: tcp
+
+        - name: Allow NodePort range
+          ufw:
+            rule: allow
+            port: '30000:32767'
+            proto: tcp
+
+        - name: Enable UFW
+          ufw:
+            state: enabled
+      when: ansible_os_family == "Debian" and configure_firewall | bool
+
+    - name: Set timezone
+      timezone:
+        name: "{{ system_timezone }}"
+
+    - name: Enable and start chronyd
+      systemd:
+        name: chronyd
+        enabled: yes
+        state: started
+
+    - name: Reboot if required (optional)
+      reboot:
+        msg: "Reboot initiated by Ansible for kernel parameters"
+        reboot_timeout: 300
+      when: false  # Set to true if you want automatic reboot
+
+- name: Verify Prerequisites
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    - name: Check if swap is disabled
+      command: swapon -s
+      register: swap_status
+      changed_when: false
+
+    - name: Verify swap is off
+      assert:
+        that: swap_status.stdout == ""
+        fail_msg: "Swap is still enabled!"
+        success_msg: "Swap is disabled"
+
+    - name: Check br_netfilter module
+      command: lsmod
+      register: lsmod_output
+      changed_when: false
+
+    - name: Verify br_netfilter is loaded
+      assert:
+        that: "'br_netfilter' in lsmod_output.stdout"
+        fail_msg: "br_netfilter module is not loaded"
+        success_msg: "br_netfilter module is loaded"
+
+    - name: Display node information
+      debug:
+        msg: "Node {{ node_name }} ({{ node_ip }}) is ready for Kubernetes installation"

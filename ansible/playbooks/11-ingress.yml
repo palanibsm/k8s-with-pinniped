@@ -1,0 +1,222 @@
+---
+- name: Install NGINX Ingress Controller
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Add NGINX Ingress Helm repository
+      command: helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+      changed_when: false
+
+    - name: Update Helm repositories
+      command: helm repo update
+      changed_when: false
+
+    - name: Check if NGINX Ingress is already installed
+      command: kubectl get namespace ingress-nginx
+      register: ingress_ns
+      changed_when: false
+      failed_when: false
+
+    - name: Create ingress-nginx namespace
+      command: kubectl create namespace ingress-nginx
+      when: ingress_ns.rc != 0
+
+    - name: Create NGINX Ingress values file
+      copy:
+        dest: /tmp/nginx-ingress-values.yaml
+        content: |
+          controller:
+            # Use LoadBalancer service type (MetalLB will assign IP)
+            service:
+              type: LoadBalancer
+              externalTrafficPolicy: Local
+
+            # Enable Prometheus metrics
+            metrics:
+              enabled: true
+              serviceMonitor:
+                enabled: true
+
+            # Resource limits
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+
+            # Replicas for HA
+            replicaCount: 2
+
+            # Admission webhooks
+            admissionWebhooks:
+              enabled: true
+
+            # Additional configuration
+            config:
+              use-forwarded-headers: "true"
+              compute-full-forwarded-for: "true"
+              use-proxy-protocol: "false"
+        mode: '0644'
+
+    - name: Install NGINX Ingress using Helm
+      command: >
+        helm install ingress-nginx ingress-nginx/ingress-nginx
+        --namespace ingress-nginx
+        --values /tmp/nginx-ingress-values.yaml
+        --version {{ ingress_nginx_chart_version }}
+        --wait
+        --timeout 10m
+      register: ingress_install
+      when: ingress_ns.rc != 0
+
+    - name: Display NGINX Ingress installation output
+      debug:
+        var: ingress_install.stdout_lines
+      when: ingress_ns.rc != 0
+
+    - name: Wait for NGINX Ingress controller to be ready
+      command: kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=controller -n ingress-nginx --timeout=300s
+      register: controller_ready
+      retries: 3
+      delay: 10
+      until: controller_ready.rc == 0
+
+    - name: Get Ingress controller LoadBalancer IP
+      shell: kubectl get svc ingress-nginx-controller -n ingress-nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      register: ingress_ip
+      retries: 30
+      delay: 10
+      until: ingress_ip.stdout != ""
+      changed_when: false
+
+    - name: Display Ingress LoadBalancer IP
+      debug:
+        msg: "NGINX Ingress LoadBalancer IP: {{ ingress_ip.stdout }}"
+
+    - name: Save Ingress configuration
+      fetch:
+        src: /tmp/nginx-ingress-values.yaml
+        dest: "{{ playbook_dir }}/../configs/ingress/nginx-values.yaml"
+        flat: yes
+
+    - name: Create test Ingress resource
+      copy:
+        dest: /tmp/test-ingress.yaml
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: hello-world
+            namespace: default
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: hello-world
+            template:
+              metadata:
+                labels:
+                  app: hello-world
+              spec:
+                containers:
+                - name: hello-world
+                  image: gcr.io/google-samples/hello-app:1.0
+                  ports:
+                  - containerPort: 8080
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: hello-world
+            namespace: default
+          spec:
+            type: ClusterIP
+            selector:
+              app: hello-world
+            ports:
+            - port: 80
+              targetPort: 8080
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: hello-world
+            namespace: default
+          spec:
+            ingressClassName: nginx
+            rules:
+            - host: hello.{{ base_domain }}
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: hello-world
+                      port:
+                        number: 80
+        mode: '0644'
+
+    - name: Apply test Ingress
+      command: kubectl apply -f /tmp/test-ingress.yaml
+      register: test_ingress
+
+    - name: Wait for test deployment to be ready
+      command: kubectl wait --for=condition=available deployment hello-world --timeout=120s
+      register: deployment_ready
+      retries: 3
+      delay: 10
+      until: deployment_ready.rc == 0
+
+    - name: Test Ingress using curl (with Host header)
+      shell: curl -H "Host: hello.{{ base_domain }}" http://{{ ingress_ip.stdout }}
+      register: ingress_test
+      retries: 10
+      delay: 5
+      until: "'Hello, world!' in ingress_test.stdout"
+      changed_when: false
+
+    - name: Display Ingress test result
+      debug:
+        msg: "Ingress is working! Response: {{ ingress_test.stdout }}"
+
+    - name: Get NGINX Ingress pods
+      command: kubectl get pods -n ingress-nginx
+      register: ingress_pods
+      changed_when: false
+
+    - name: Display NGINX Ingress pods
+      debug:
+        var: ingress_pods.stdout_lines
+
+    - name: Get all Ingress resources
+      command: kubectl get ingress -A
+      register: all_ingress
+      changed_when: false
+
+    - name: Display all Ingress resources
+      debug:
+        var: all_ingress.stdout_lines
+
+    - name: Clean up test resources
+      command: kubectl delete -f /tmp/test-ingress.yaml
+      changed_when: false
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "NGINX Ingress Controller Installed!"
+          - "==========================================="
+          - "Ingress LoadBalancer IP: {{ ingress_ip.stdout }}"
+          - ""
+          - "To use Ingress in your cluster:"
+          - "1. Update DNS to point *.{{ base_domain }} to {{ ingress_ip.stdout }}"
+          - "2. Create Ingress resources with ingressClassName: nginx"
+          - ""
+          - "Configuration saved to: configs/ingress/nginx-values.yaml"
+          - ""
+          - "Next: Install cert-manager"
+          - "==========================================="

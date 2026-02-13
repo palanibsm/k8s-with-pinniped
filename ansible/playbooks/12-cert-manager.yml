@@ -1,0 +1,250 @@
+---
+- name: Install cert-manager
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Add Jetstack Helm repository
+      command: helm repo add jetstack https://charts.jetstack.io
+      changed_when: false
+
+    - name: Update Helm repositories
+      command: helm repo update
+      changed_when: false
+
+    - name: Check if cert-manager is already installed
+      command: kubectl get namespace cert-manager
+      register: certmanager_ns
+      changed_when: false
+      failed_when: false
+
+    - name: Create cert-manager namespace
+      command: kubectl create namespace cert-manager
+      when: certmanager_ns.rc != 0
+
+    - name: Install cert-manager CRDs
+      command: >
+        kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/{{ cert_manager_version }}/cert-manager.crds.yaml
+      when: certmanager_ns.rc != 0
+
+    - name: Install cert-manager using Helm
+      command: >
+        helm install cert-manager jetstack/cert-manager
+        --namespace cert-manager
+        --version {{ cert_manager_version }}
+        --set installCRDs=false
+        --set prometheus.enabled=true
+        --wait
+        --timeout 10m
+      register: certmanager_install
+      when: certmanager_ns.rc != 0
+
+    - name: Display cert-manager installation output
+      debug:
+        var: certmanager_install.stdout_lines
+      when: certmanager_ns.rc != 0
+
+    - name: Wait for cert-manager to be ready
+      command: kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=300s
+      register: certmanager_ready
+      retries: 3
+      delay: 10
+      until: certmanager_ready.rc == 0
+
+    - name: Create Let's Encrypt Staging ClusterIssuer
+      copy:
+        dest: /tmp/letsencrypt-staging-issuer.yaml
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              email: {{ cert_manager_email }}
+              privateKeySecretRef:
+                name: letsencrypt-staging
+              solvers:
+              - http01:
+                  ingress:
+                    class: nginx
+        mode: '0644'
+
+    - name: Create Let's Encrypt Production ClusterIssuer
+      copy:
+        dest: /tmp/letsencrypt-prod-issuer.yaml
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-prod
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: {{ cert_manager_email }}
+              privateKeySecretRef:
+                name: letsencrypt-prod
+              solvers:
+              - http01:
+                  ingress:
+                    class: nginx
+        mode: '0644'
+
+    - name: Create Self-Signed ClusterIssuer (for internal use)
+      copy:
+        dest: /tmp/selfsigned-issuer.yaml
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: selfsigned-issuer
+          spec:
+            selfSigned: {}
+        mode: '0644'
+
+    - name: Apply Let's Encrypt Staging ClusterIssuer
+      command: kubectl apply -f /tmp/letsencrypt-staging-issuer.yaml
+      register: staging_issuer
+
+    - name: Apply Let's Encrypt Production ClusterIssuer
+      command: kubectl apply -f /tmp/letsencrypt-prod-issuer.yaml
+      register: prod_issuer
+
+    - name: Apply Self-Signed ClusterIssuer
+      command: kubectl apply -f /tmp/selfsigned-issuer.yaml
+      register: selfsigned_issuer
+
+    - name: Wait for ClusterIssuers to be ready
+      pause:
+        seconds: 10
+
+    - name: Get ClusterIssuers
+      command: kubectl get clusterissuer
+      register: clusterissuers
+      changed_when: false
+
+    - name: Display ClusterIssuers
+      debug:
+        var: clusterissuers.stdout_lines
+
+    - name: Save ClusterIssuer configurations
+      shell: |
+        cat /tmp/letsencrypt-staging-issuer.yaml /tmp/letsencrypt-prod-issuer.yaml /tmp/selfsigned-issuer.yaml > /tmp/all-issuers.yaml
+      changed_when: false
+
+    - name: Fetch ClusterIssuer configurations
+      fetch:
+        src: /tmp/all-issuers.yaml
+        dest: "{{ playbook_dir }}/../configs/cert-manager/cluster-issuers.yaml"
+        flat: yes
+
+    - name: Create test certificate
+      copy:
+        dest: /tmp/test-certificate.yaml
+        content: |
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: test-certificate
+            namespace: default
+          spec:
+            secretName: test-certificate-tls
+            issuerRef:
+              name: selfsigned-issuer
+              kind: ClusterIssuer
+            dnsNames:
+            - test.{{ base_domain }}
+        mode: '0644'
+
+    - name: Apply test certificate
+      command: kubectl apply -f /tmp/test-certificate.yaml
+      register: test_cert
+
+    - name: Wait for test certificate to be ready
+      shell: kubectl get certificate test-certificate -n default -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: cert_ready
+      retries: 30
+      delay: 5
+      until: cert_ready.stdout == "True"
+      changed_when: false
+
+    - name: Display test certificate status
+      command: kubectl describe certificate test-certificate -n default
+      register: cert_status
+      changed_when: false
+
+    - name: Display certificate details
+      debug:
+        msg: "Test certificate created and ready!"
+
+    - name: Get cert-manager pods
+      command: kubectl get pods -n cert-manager
+      register: certmanager_pods
+      changed_when: false
+
+    - name: Display cert-manager pods
+      debug:
+        var: certmanager_pods.stdout_lines
+
+    - name: Clean up test certificate
+      command: kubectl delete -f /tmp/test-certificate.yaml
+      changed_when: false
+
+    - name: Create example Ingress with TLS
+      copy:
+        dest: /tmp/example-ingress-tls.yaml
+        content: |
+          # Example Ingress with automatic TLS from Let's Encrypt
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: example-app
+            namespace: default
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-prod"  # Or letsencrypt-staging for testing
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - example.{{ base_domain }}
+              secretName: example-app-tls  # cert-manager will create this secret
+            rules:
+            - host: example.{{ base_domain }}
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: example-app-service
+                      port:
+                        number: 80
+        mode: '0644'
+
+    - name: Save example Ingress with TLS
+      fetch:
+        src: /tmp/example-ingress-tls.yaml
+        dest: "{{ playbook_dir }}/../configs/cert-manager/example-ingress-tls.yaml"
+        flat: yes
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "cert-manager Installed Successfully!"
+          - "==========================================="
+          - "Version: {{ cert_manager_version }}"
+          - "Email: {{ cert_manager_email }}"
+          - ""
+          - "Available ClusterIssuers:"
+          - "  - letsencrypt-staging (for testing)"
+          - "  - letsencrypt-prod (for production)"
+          - "  - selfsigned-issuer (for internal use)"
+          - ""
+          - "To use automatic TLS, add this annotation to your Ingress:"
+          - "  cert-manager.io/cluster-issuer: letsencrypt-prod"
+          - ""
+          - "Example saved to: configs/cert-manager/example-ingress-tls.yaml"
+          - ""
+          - "Next: Install Monitoring Stack"
+          - "==========================================="

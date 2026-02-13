@@ -1,0 +1,180 @@
+---
+- name: Create Storage Directories on All Nodes
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    - name: Create local-path-provisioner directory
+      file:
+        path: "{{ local_path_storage_path }}"
+        state: directory
+        mode: '0755'
+
+- name: Install Local Path Provisioner
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Check if Local Path Provisioner is already installed
+      command: kubectl get storageclass local-path
+      register: local_path_sc
+      changed_when: false
+      failed_when: false
+
+    - name: Download Local Path Provisioner manifest
+      get_url:
+        url: "https://raw.githubusercontent.com/rancher/local-path-provisioner/{{ local_path_provisioner_version }}/deploy/local-path-storage.yaml"
+        dest: /tmp/local-path-provisioner.yaml
+        mode: '0644'
+      when: local_path_sc.rc != 0
+
+    - name: Modify Local Path Provisioner config to use custom path
+      replace:
+        path: /tmp/local-path-provisioner.yaml
+        regexp: '/opt/local-path-provisioner'
+        replace: "{{ local_path_storage_path }}"
+      when: local_path_sc.rc != 0
+
+    - name: Apply Local Path Provisioner
+      command: kubectl apply -f /tmp/local-path-provisioner.yaml
+      register: provisioner_install
+      when: local_path_sc.rc != 0
+
+    - name: Display provisioner installation output
+      debug:
+        var: provisioner_install.stdout_lines
+      when: local_path_sc.rc != 0
+
+    - name: Wait for Local Path Provisioner to be ready
+      command: kubectl wait --for=condition=ready pod -l app=local-path-provisioner -n local-path-storage --timeout=300s
+      register: provisioner_ready
+      retries: 3
+      delay: 10
+      until: provisioner_ready.rc == 0
+
+    - name: Set local-path as default StorageClass
+      command: kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+      register: default_sc
+      changed_when: "'patched' in default_sc.stdout"
+
+    - name: Get StorageClasses
+      command: kubectl get storageclass
+      register: storage_classes
+      changed_when: false
+
+    - name: Display StorageClasses
+      debug:
+        var: storage_classes.stdout_lines
+
+    - name: Save Local Path Provisioner config
+      fetch:
+        src: /tmp/local-path-provisioner.yaml
+        dest: "{{ playbook_dir }}/../configs/storage/local-path-provisioner.yaml"
+        flat: yes
+
+    - name: Create test PVC
+      copy:
+        dest: /tmp/test-pvc.yaml
+        content: |
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: test-pvc
+            namespace: default
+          spec:
+            accessModes:
+            - ReadWriteOnce
+            storageClassName: local-path
+            resources:
+              requests:
+                storage: 1Gi
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: test-pvc-pod
+            namespace: default
+          spec:
+            containers:
+            - name: test-container
+              image: busybox
+              command:
+              - sh
+              - -c
+              - "echo 'Storage test successful!' > /mnt/test.txt && cat /mnt/test.txt && sleep 3600"
+              volumeMounts:
+              - name: test-volume
+                mountPath: /mnt
+            volumes:
+            - name: test-volume
+              persistentVolumeClaim:
+                claimName: test-pvc
+        mode: '0644'
+
+    - name: Apply test PVC
+      command: kubectl apply -f /tmp/test-pvc.yaml
+      register: test_pvc
+
+    - name: Wait for test PVC to be bound
+      shell: kubectl get pvc test-pvc -o jsonpath='{.status.phase}'
+      register: pvc_status
+      retries: 30
+      delay: 5
+      until: pvc_status.stdout == "Bound"
+      changed_when: false
+
+    - name: Wait for test pod to be ready
+      command: kubectl wait --for=condition=ready pod test-pvc-pod --timeout=120s
+      register: pod_ready
+      retries: 3
+      delay: 10
+      until: pod_ready.rc == 0
+
+    - name: Check test pod logs
+      command: kubectl logs test-pvc-pod
+      register: pod_logs
+      changed_when: false
+
+    - name: Display test results
+      debug:
+        msg: "Storage test: {{ 'SUCCESS' if 'Storage test successful' in pod_logs.stdout else 'FAILED' }}"
+
+    - name: Get PVC details
+      command: kubectl get pvc
+      register: pvc_details
+      changed_when: false
+
+    - name: Display PVC details
+      debug:
+        var: pvc_details.stdout_lines
+
+    - name: Clean up test resources
+      command: kubectl delete -f /tmp/test-pvc.yaml
+      changed_when: false
+
+    - name: Wait for PVC cleanup
+      pause:
+        seconds: 10
+
+    - name: Get Local Path Provisioner pods
+      command: kubectl get pods -n local-path-storage
+      register: provisioner_pods
+      changed_when: false
+
+    - name: Display provisioner pods
+      debug:
+        var: provisioner_pods.stdout_lines
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "Local Path Provisioner Installed!"
+          - "==========================================="
+          - "StorageClass: local-path (default)"
+          - "Storage Path: {{ local_path_storage_path }}"
+          - ""
+          - "Dynamic volume provisioning is now available"
+          - ""
+          - "Configuration saved to: configs/storage/local-path-provisioner.yaml"
+          - ""
+          - "Next: Install NGINX Ingress Controller"
+          - "==========================================="

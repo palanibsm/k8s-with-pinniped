@@ -1,0 +1,258 @@
+---
+- name: Install Cilium CLI
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Check if Cilium CLI is already installed
+      stat:
+        path: /usr/local/bin/cilium
+      register: cilium_cli
+
+    - name: Download Cilium CLI
+      get_url:
+        url: "https://github.com/cilium/cilium-cli/releases/download/v{{ cilium_cli_version }}/cilium-linux-amd64.tar.gz"
+        dest: /tmp/cilium-cli.tar.gz
+        mode: '0644'
+      when: not cilium_cli.stat.exists
+
+    - name: Extract Cilium CLI
+      unarchive:
+        src: /tmp/cilium-cli.tar.gz
+        dest: /usr/local/bin
+        remote_src: yes
+      when: not cilium_cli.stat.exists
+
+    - name: Make Cilium CLI executable
+      file:
+        path: /usr/local/bin/cilium
+        mode: '0755'
+      when: not cilium_cli.stat.exists
+
+    - name: Clean up Cilium CLI tarball
+      file:
+        path: /tmp/cilium-cli.tar.gz
+        state: absent
+
+- name: Install Helm
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Check if Helm is already installed
+      stat:
+        path: /usr/local/bin/helm
+      register: helm_binary
+
+    - name: Download Helm
+      get_url:
+        url: "https://get.helm.sh/helm-v{{ helm_version }}-linux-amd64.tar.gz"
+        dest: /tmp/helm.tar.gz
+        mode: '0644'
+      when: not helm_binary.stat.exists
+
+    - name: Extract Helm
+      unarchive:
+        src: /tmp/helm.tar.gz
+        dest: /tmp
+        remote_src: yes
+      when: not helm_binary.stat.exists
+
+    - name: Move Helm binary
+      copy:
+        src: /tmp/linux-amd64/helm
+        dest: /usr/local/bin/helm
+        remote_src: yes
+        mode: '0755'
+      when: not helm_binary.stat.exists
+
+    - name: Clean up Helm files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/helm.tar.gz
+        - /tmp/linux-amd64
+
+- name: Install Cilium CNI
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Check if Cilium is already installed
+      command: kubectl get pods -n kube-system -l k8s-app=cilium
+      register: cilium_pods
+      changed_when: false
+      failed_when: false
+
+    - name: Create Cilium values file
+      copy:
+        dest: /tmp/cilium-values.yaml
+        content: |
+          # Cilium Configuration
+          kubeProxyReplacement: {{ 'true' if cilium_kube_proxy_replacement else 'false' }}
+          k8sServiceHost: {{ control_plane_vip }}
+          k8sServicePort: {{ control_plane_port }}
+
+          # Operator Configuration
+          operator:
+            replicas: 2
+
+          # IPAM Configuration
+          ipam:
+            mode: kubernetes
+
+          # Hubble Configuration (Observability)
+          hubble:
+            enabled: {{ 'true' if enable_hubble else 'false' }}
+            relay:
+              enabled: {{ 'true' if enable_hubble else 'false' }}
+              replicas: 2
+            ui:
+              enabled: {{ 'true' if enable_hubble_ui else 'false' }}
+              replicas: 1
+
+          # BGP Control Plane (for advanced networking)
+          bgpControlPlane:
+            enabled: false
+
+          # Enable Prometheus metrics
+          prometheus:
+            enabled: true
+
+          # Encryption (optional, can be enabled for pod-to-pod encryption)
+          encryption:
+            enabled: false
+            type: wireguard
+        mode: '0644'
+      when: cilium_pods.rc != 0 or cilium_pods.stdout == ""
+
+    - name: Install Cilium using Helm
+      command: >
+        helm install cilium cilium/cilium
+        --version {{ cilium_version }}
+        --namespace kube-system
+        --values /tmp/cilium-values.yaml
+      register: cilium_install
+      when: cilium_pods.rc != 0 or cilium_pods.stdout == ""
+
+    - name: Display Cilium installation output
+      debug:
+        var: cilium_install.stdout_lines
+      when: cilium_pods.rc != 0 or cilium_pods.stdout == ""
+
+    - name: Wait for Cilium pods to be ready
+      command: kubectl wait --for=condition=ready pod -l k8s-app=cilium -n kube-system --timeout=300s
+      register: cilium_ready
+      retries: 3
+      delay: 10
+      until: cilium_ready.rc == 0
+
+    - name: Wait for Cilium Operator pods to be ready
+      command: kubectl wait --for=condition=ready pod -l name=cilium-operator -n kube-system --timeout=300s
+      register: operator_ready
+      retries: 3
+      delay: 10
+      until: operator_ready.rc == 0
+
+    - name: Check Cilium status
+      command: cilium status --wait
+      register: cilium_status
+      changed_when: false
+
+    - name: Display Cilium status
+      debug:
+        var: cilium_status.stdout_lines
+
+    - name: Run Cilium connectivity test (optional - can take 5-10 minutes)
+      command: cilium connectivity test --test-concurrency=1
+      register: connectivity_test
+      changed_when: false
+      failed_when: false
+      when: false  # Set to true to run connectivity test
+
+    - name: Display connectivity test results
+      debug:
+        var: connectivity_test.stdout_lines
+      when: false  # Set to true to display results
+
+    - name: Get Cilium pods
+      command: kubectl get pods -n kube-system -l k8s-app=cilium -o wide
+      register: cilium_pods_status
+      changed_when: false
+
+    - name: Display Cilium pods
+      debug:
+        var: cilium_pods_status.stdout_lines
+
+    - name: Get all pods in kube-system
+      command: kubectl get pods -n kube-system
+      register: all_system_pods
+      changed_when: false
+
+    - name: Display all kube-system pods
+      debug:
+        var: all_system_pods.stdout_lines
+
+    - name: Wait for all nodes to be Ready
+      command: kubectl get nodes
+      register: nodes_ready
+      retries: 20
+      delay: 15
+      until: "'NotReady' not in nodes_ready.stdout"
+      changed_when: false
+
+    - name: Display nodes status
+      debug:
+        var: nodes_ready.stdout_lines
+
+    - name: Create Hubble ingress (if Hubble UI is enabled)
+      copy:
+        dest: /tmp/hubble-ingress.yaml
+        content: |
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: hubble-ui
+            namespace: kube-system
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-prod"
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - hubble.{{ base_domain }}
+              secretName: hubble-tls
+            rules:
+            - host: hubble.{{ base_domain }}
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: hubble-ui
+                      port:
+                        number: 80
+        mode: '0644'
+      when: enable_hubble_ui | bool
+
+    - name: Save Hubble ingress config
+      fetch:
+        src: /tmp/hubble-ingress.yaml
+        dest: "{{ playbook_dir }}/../configs/cilium/hubble-ingress.yaml"
+        flat: yes
+      when: enable_hubble_ui | bool
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "Cilium CNI Installed Successfully!"
+          - "==========================================="
+          - "Cilium Version: {{ cilium_version }}"
+          - "Hubble Enabled: {{ enable_hubble }}"
+          - "Hubble UI Enabled: {{ enable_hubble_ui }}"
+          - "kube-proxy Replacement: {{ cilium_kube_proxy_replacement }}"
+          - ""
+          - "All nodes should now be in Ready state"
+          - ""
+          - "Next: Install MetalLB"
+          - "==========================================="

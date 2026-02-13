@@ -1,0 +1,195 @@
+---
+- name: Install MetalLB Load Balancer
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Add MetalLB Helm repository
+      command: helm repo add metallb https://metallb.github.io/metallb
+      changed_when: false
+
+    - name: Update Helm repositories
+      command: helm repo update
+      changed_when: false
+
+    - name: Check if MetalLB is already installed
+      command: kubectl get namespace metallb-system
+      register: metallb_ns
+      changed_when: false
+      failed_when: false
+
+    - name: Create metallb-system namespace
+      command: kubectl create namespace metallb-system
+      when: metallb_ns.rc != 0
+
+    - name: Install MetalLB using Helm
+      command: >
+        helm install metallb metallb/metallb
+        --version {{ metallb_version }}
+        --namespace metallb-system
+        --wait
+      register: metallb_install
+      when: metallb_ns.rc != 0
+
+    - name: Display MetalLB installation output
+      debug:
+        var: metallb_install.stdout_lines
+      when: metallb_ns.rc != 0
+
+    - name: Wait for MetalLB controller to be ready
+      command: kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=controller -n metallb-system --timeout=300s
+      register: controller_ready
+      retries: 3
+      delay: 10
+      until: controller_ready.rc == 0
+
+    - name: Wait for MetalLB speaker to be ready
+      command: kubectl wait --for=condition=ready pod -l app.kubernetes.io/component=speaker -n metallb-system --timeout=300s
+      register: speaker_ready
+      retries: 3
+      delay: 10
+      until: speaker_ready.rc == 0
+
+    - name: Create MetalLB IPAddressPool configuration
+      copy:
+        dest: /tmp/metallb-ippool.yaml
+        content: |
+          apiVersion: metallb.io/v1beta1
+          kind: IPAddressPool
+          metadata:
+            name: default-pool
+            namespace: metallb-system
+          spec:
+            addresses:
+            - {{ metallb_ip_range }}
+          ---
+          apiVersion: metallb.io/v1beta1
+          kind: L2Advertisement
+          metadata:
+            name: default-l2-adv
+            namespace: metallb-system
+          spec:
+            ipAddressPools:
+            - default-pool
+        mode: '0644'
+
+    - name: Apply MetalLB IPAddressPool configuration
+      command: kubectl apply -f /tmp/metallb-ippool.yaml
+      register: ippool_apply
+
+    - name: Display IPAddressPool configuration
+      debug:
+        var: ippool_apply.stdout_lines
+
+    - name: Save MetalLB configuration to local
+      fetch:
+        src: /tmp/metallb-ippool.yaml
+        dest: "{{ playbook_dir }}/../configs/metallb/ippool.yaml"
+        flat: yes
+
+    - name: Get MetalLB pods
+      command: kubectl get pods -n metallb-system
+      register: metallb_pods
+      changed_when: false
+
+    - name: Display MetalLB pods
+      debug:
+        var: metallb_pods.stdout_lines
+
+    - name: Get MetalLB IPAddressPool
+      command: kubectl get ipaddresspool -n metallb-system
+      register: ipaddresspool
+      changed_when: false
+
+    - name: Display IPAddressPool
+      debug:
+        var: ipaddresspool.stdout_lines
+
+    - name: Create test LoadBalancer service
+      copy:
+        dest: /tmp/test-lb-service.yaml
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: test-lb-service
+            namespace: default
+          spec:
+            type: LoadBalancer
+            selector:
+              app: test-nginx
+            ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 80
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: test-nginx
+            namespace: default
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: test-nginx
+            template:
+              metadata:
+                labels:
+                  app: test-nginx
+              spec:
+                containers:
+                - name: nginx
+                  image: nginx:alpine
+                  ports:
+                  - containerPort: 80
+        mode: '0644'
+
+    - name: Apply test LoadBalancer service
+      command: kubectl apply -f /tmp/test-lb-service.yaml
+      register: test_service
+
+    - name: Wait for LoadBalancer IP to be assigned
+      shell: kubectl get svc test-lb-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      register: lb_ip
+      retries: 30
+      delay: 10
+      until: lb_ip.stdout != ""
+      changed_when: false
+
+    - name: Display LoadBalancer IP
+      debug:
+        msg: "Test LoadBalancer IP: {{ lb_ip.stdout }}"
+
+    - name: Test LoadBalancer connectivity
+      uri:
+        url: "http://{{ lb_ip.stdout }}"
+        return_content: yes
+      register: lb_test
+      retries: 10
+      delay: 5
+      until: lb_test.status == 200
+
+    - name: Display LoadBalancer test result
+      debug:
+        msg: "LoadBalancer is working! Nginx welcome page retrieved successfully"
+
+    - name: Clean up test resources
+      command: kubectl delete -f /tmp/test-lb-service.yaml
+      changed_when: false
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "MetalLB Installed Successfully!"
+          - "==========================================="
+          - "MetalLB Version: {{ metallb_version }}"
+          - "IP Range: {{ metallb_ip_range }}"
+          - ""
+          - "LoadBalancer services will now receive external IPs"
+          - "from the configured IP pool"
+          - ""
+          - "Configuration saved to: configs/metallb/ippool.yaml"
+          - ""
+          - "Next: Install Storage Provisioner"
+          - "==========================================="

@@ -1,0 +1,129 @@
+---
+- name: Install containerd Container Runtime
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    - name: Remove old Docker packages if present (Debian/Ubuntu)
+      apt:
+        name:
+          - docker
+          - docker-engine
+          - docker.io
+          - containerd
+          - runc
+        state: absent
+      when: ansible_os_family == "Debian"
+
+    - name: Remove old Docker packages if present (RHEL/CentOS)
+      yum:
+        name:
+          - docker
+          - docker-client
+          - docker-client-latest
+          - docker-common
+          - docker-latest
+          - docker-latest-logrotate
+          - docker-logrotate
+          - docker-engine
+          - containerd
+          - runc
+        state: absent
+      when: ansible_os_family == "RedHat"
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Download containerd (Debian/Ubuntu)
+      get_url:
+        url: "https://github.com/containerd/containerd/releases/download/v{{ containerd_version }}/containerd-{{ containerd_version }}-linux-amd64.tar.gz"
+        dest: /tmp/containerd.tar.gz
+        mode: '0644'
+
+    - name: Extract containerd
+      unarchive:
+        src: /tmp/containerd.tar.gz
+        dest: /usr/local
+        remote_src: yes
+
+    - name: Download containerd systemd service file
+      get_url:
+        url: "https://raw.githubusercontent.com/containerd/containerd/main/containerd.service"
+        dest: /etc/systemd/system/containerd.service
+        mode: '0644'
+
+    - name: Download runc
+      get_url:
+        url: "https://github.com/opencontainers/runc/releases/download/v{{ runc_version }}/runc.amd64"
+        dest: /usr/local/sbin/runc
+        mode: '0755'
+
+    - name: Create CNI plugin directory
+      file:
+        path: /opt/cni/bin
+        state: directory
+        mode: '0755'
+
+    - name: Download CNI plugins
+      get_url:
+        url: "https://github.com/containernetworking/plugins/releases/download/v{{ cni_plugins_version }}/cni-plugins-linux-amd64-v{{ cni_plugins_version }}.tgz"
+        dest: /tmp/cni-plugins.tgz
+        mode: '0644'
+
+    - name: Extract CNI plugins
+      unarchive:
+        src: /tmp/cni-plugins.tgz
+        dest: /opt/cni/bin
+        remote_src: yes
+
+    - name: Generate default containerd configuration
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Configure containerd to use systemd cgroup driver
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Enable systemd cgroup in containerd config (alternative location)
+      lineinfile:
+        path: /etc/containerd/config.toml
+        insertafter: '^\[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options\]'
+        line: '            SystemdCgroup = true'
+        state: present
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    - name: Wait for containerd to be ready
+      wait_for:
+        path: /run/containerd/containerd.sock
+        timeout: 60
+
+    - name: Verify containerd is running
+      command: ctr version
+      register: containerd_version_output
+      changed_when: false
+
+    - name: Display containerd version
+      debug:
+        msg: "{{ containerd_version_output.stdout_lines }}"
+
+    - name: Clean up downloaded files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/containerd.tar.gz
+        - /tmp/cni-plugins.tgz

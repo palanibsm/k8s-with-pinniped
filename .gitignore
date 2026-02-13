@@ -30,11 +30,40 @@ terraform.rc
 # Ansible
 *.retry
 .ansible/
-ansible.cfg
 ansible.log
 *.vault
 *.vault.yml
 *.vault.yaml
+
+# Kubernetes
+configs/kubeconfig
+*.kubeconfig
+join-command-*.sh
+
+# Secrets
+secrets/
+*.secret
+*-secrets.yaml
+*-secret.yaml
+
+# SSH Keys
+*.pem
+*.key
+id_rsa*
+
+# Certificates
+*.crt
+*.csr
+
+# Backup files
+*.backup
+*.bak
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
 
 # AWS
 .aws/

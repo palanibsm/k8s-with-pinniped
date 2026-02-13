@@ -1,0 +1,275 @@
+---
+- name: Install Harbor Container Registry
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Add Harbor Helm repository
+      command: helm repo add harbor https://helm.goharbor.io
+      changed_when: false
+
+    - name: Update Helm repositories
+      command: helm repo update
+      changed_when: false
+
+    - name: Check if harbor namespace exists
+      command: kubectl get namespace harbor
+      register: harbor_ns
+      changed_when: false
+      failed_when: false
+
+    - name: Create harbor namespace
+      command: kubectl create namespace harbor
+      when: harbor_ns.rc != 0
+
+    - name: Create Harbor values file
+      copy:
+        dest: /tmp/harbor-values.yaml
+        content: |
+          # Expose Configuration
+          expose:
+            type: ingress
+            tls:
+              enabled: true
+              certSource: secret
+              secret:
+                secretName: harbor-tls
+                notarySecretName: harbor-notary-tls
+            ingress:
+              hosts:
+                core: harbor.{{ base_domain }}
+                notary: notary.{{ base_domain }}
+              className: nginx
+              annotations:
+                cert-manager.io/cluster-issuer: "letsencrypt-prod"
+                nginx.ingress.kubernetes.io/proxy-body-size: "0"
+                nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+          # External URL
+          externalURL: https://harbor.{{ base_domain }}
+
+          # Harbor admin password
+          harborAdminPassword: "{{ harbor_admin_password }}"
+
+          # Persistence
+          persistence:
+            enabled: true
+            resourcePolicy: "keep"
+            persistentVolumeClaim:
+              registry:
+                storageClass: local-path
+                size: {{ harbor_storage_size }}
+              chartmuseum:
+                storageClass: local-path
+                size: 10Gi
+              jobservice:
+                jobLog:
+                  storageClass: local-path
+                  size: 5Gi
+              database:
+                storageClass: local-path
+                size: 10Gi
+              redis:
+                storageClass: local-path
+                size: 5Gi
+              trivy:
+                storageClass: local-path
+                size: 10Gi
+
+          # PostgreSQL
+          database:
+            type: internal
+            internal:
+              password: "{{ harbor_admin_password }}"
+
+          # Redis
+          redis:
+            type: internal
+
+          # Trivy (Vulnerability Scanner)
+          trivy:
+            enabled: true
+
+          # ChartMuseum (Helm Chart Repository)
+          chartmuseum:
+            enabled: true
+
+          # Notary (Content Trust)
+          notary:
+            enabled: false
+
+          # Core
+          core:
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+              limits:
+                cpu: 1000m
+                memory: 1Gi
+
+          # Registry
+          registry:
+            registry:
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+
+          # Metrics
+          metrics:
+            enabled: true
+            serviceMonitor:
+              enabled: true
+        mode: '0644'
+
+    - name: Check if Harbor is already installed
+      command: helm list -n harbor
+      register: helm_list
+      changed_when: false
+
+    - name: Install Harbor using Helm
+      command: >
+        helm install harbor harbor/harbor
+        --namespace harbor
+        --values /tmp/harbor-values.yaml
+        --version {{ harbor_chart_version }}
+        --wait
+        --timeout 20m
+      register: harbor_install
+      when: "'harbor' not in helm_list.stdout"
+
+    - name: Display Harbor installation output
+      debug:
+        var: harbor_install.stdout_lines
+      when: "'harbor' not in helm_list.stdout"
+
+    - name: Wait for Harbor core to be ready
+      command: kubectl wait --for=condition=ready pod -l component=core -n harbor --timeout=600s
+      register: core_ready
+      retries: 3
+      delay: 20
+      until: core_ready.rc == 0
+
+    - name: Wait for Harbor registry to be ready
+      command: kubectl wait --for=condition=ready pod -l component=registry -n harbor --timeout=300s
+      register: registry_ready
+      retries: 3
+      delay: 10
+      until: registry_ready.rc == 0
+
+    - name: Save Harbor configuration
+      fetch:
+        src: /tmp/harbor-values.yaml
+        dest: "{{ playbook_dir }}/../configs/harbor/harbor-values.yaml"
+        flat: yes
+
+    - name: Get Harbor pods
+      command: kubectl get pods -n harbor
+      register: harbor_pods
+      changed_when: false
+
+    - name: Display Harbor pods
+      debug:
+        var: harbor_pods.stdout_lines
+
+    - name: Get Harbor services
+      command: kubectl get svc -n harbor
+      register: harbor_services
+      changed_when: false
+
+    - name: Display Harbor services
+      debug:
+        var: harbor_services.stdout_lines
+
+    - name: Get Harbor PVCs
+      command: kubectl get pvc -n harbor
+      register: harbor_pvcs
+      changed_when: false
+
+    - name: Display Harbor PVCs
+      debug:
+        var: harbor_pvcs.stdout_lines
+
+    - name: Get Harbor Ingress
+      command: kubectl get ingress -n harbor
+      register: harbor_ingress
+      changed_when: false
+
+    - name: Display Harbor Ingress
+      debug:
+        var: harbor_ingress.stdout_lines
+
+    - name: Create Docker config for Harbor authentication (example)
+      copy:
+        dest: /tmp/harbor-docker-config.sh
+        content: |
+          #!/bin/bash
+          # Script to configure Docker/containerd to use Harbor registry
+
+          echo "To use Harbor registry with Docker/containerd:"
+          echo ""
+          echo "1. Login to Harbor:"
+          echo "   docker login harbor.{{ base_domain }}"
+          echo "   Username: admin"
+          echo "   Password: {{ harbor_admin_password }}"
+          echo ""
+          echo "2. Tag and push images:"
+          echo "   docker tag myimage:latest harbor.{{ base_domain }}/library/myimage:latest"
+          echo "   docker push harbor.{{ base_domain }}/library/myimage:latest"
+          echo ""
+          echo "3. Create Kubernetes secret for Harbor (optional):"
+          echo "   kubectl create secret docker-registry harbor-registry \\"
+          echo "     --docker-server=harbor.{{ base_domain }} \\"
+          echo "     --docker-username=admin \\"
+          echo "     --docker-password={{ harbor_admin_password }} \\"
+          echo "     --docker-email=admin@example.com"
+          echo ""
+          echo "4. Use the secret in your pod specs:"
+          echo "   spec:"
+          echo "     imagePullSecrets:"
+          echo "     - name: harbor-registry"
+        mode: '0755'
+
+    - name: Display Harbor usage instructions
+      command: bash /tmp/harbor-docker-config.sh
+      register: harbor_usage
+      changed_when: false
+
+    - name: Show Harbor usage
+      debug:
+        var: harbor_usage.stdout_lines
+
+    - name: Save Harbor usage script
+      fetch:
+        src: /tmp/harbor-docker-config.sh
+        dest: "{{ playbook_dir }}/../configs/harbor/harbor-usage.sh"
+        flat: yes
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "Harbor Container Registry Installed!"
+          - "==========================================="
+          - "Harbor Version: {{ harbor_version }}"
+          - ""
+          - "Access URL (after DNS configuration):"
+          - "  https://harbor.{{ base_domain }}"
+          - ""
+          - "Credentials:"
+          - "  Username: admin"
+          - "  Password: {{ harbor_admin_password }}"
+          - ""
+          - "Features enabled:"
+          - "  - Container Registry"
+          - "  - Helm Chart Repository"
+          - "  - Trivy Vulnerability Scanner"
+          - "  - RBAC & Project Management"
+          - ""
+          - "Configuration saved to: configs/harbor/"
+          - ""
+          - "IMPORTANT: Change the admin password after first login!"
+          - "==========================================="

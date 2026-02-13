@@ -1,0 +1,224 @@
+---
+- name: Install and Configure HAProxy + Keepalived for Control Plane HA
+  hosts: loadbalancer
+  become: yes
+  tasks:
+    - name: Install HAProxy (Debian/Ubuntu)
+      apt:
+        name:
+          - haproxy
+          - keepalived
+        state: present
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Install HAProxy (RHEL/CentOS)
+      yum:
+        name:
+          - haproxy
+          - keepalived
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Backup original HAProxy config
+      copy:
+        src: /etc/haproxy/haproxy.cfg
+        dest: /etc/haproxy/haproxy.cfg.backup
+        remote_src: yes
+        force: no
+
+    - name: Configure HAProxy for Kubernetes API
+      copy:
+        dest: /etc/haproxy/haproxy.cfg
+        content: |
+          global
+              log /dev/log local0
+              log /dev/log local1 notice
+              chroot /var/lib/haproxy
+              stats socket /run/haproxy/admin.sock mode 660 level admin
+              stats timeout 30s
+              user haproxy
+              group haproxy
+              daemon
+
+          defaults
+              log     global
+              mode    tcp
+              option  tcplog
+              option  dontlognull
+              timeout connect 5000
+              timeout client  50000
+              timeout server  50000
+
+          # Kubernetes API Server
+          frontend kubernetes-apiserver
+              bind *:{{ control_plane_port }}
+              mode tcp
+              option tcplog
+              default_backend kubernetes-apiserver
+
+          backend kubernetes-apiserver
+              mode tcp
+              option tcp-check
+              balance roundrobin
+          {% for host in groups['control_plane'] %}
+              server {{ hostvars[host].node_name }} {{ hostvars[host].node_ip }}:{{ control_plane_port }} check fall 3 rise 2
+          {% endfor %}
+
+          # HAProxy Stats
+          listen stats
+              bind *:{{ haproxy_stats_port }}
+              mode http
+              stats enable
+              stats uri /stats
+              stats realm HAProxy\ Statistics
+              stats auth {{ haproxy_stats_user }}:{{ haproxy_stats_password }}
+              stats refresh 30s
+        mode: '0644'
+      notify: restart haproxy
+
+    - name: Enable and start HAProxy
+      systemd:
+        name: haproxy
+        enabled: yes
+        state: started
+
+    - name: Configure Keepalived
+      copy:
+        dest: /etc/keepalived/keepalived.conf
+        content: |
+          global_defs {
+              router_id LVS_DEVEL
+              enable_script_security
+              script_user root
+          }
+
+          vrrp_script check_apiserver {
+              script "/etc/keepalived/check_apiserver.sh"
+              interval 3
+              weight -2
+              fall 10
+              rise 2
+          }
+
+          vrrp_instance VI_1 {
+              state {% if inventory_hostname == groups['loadbalancer'][0] %}MASTER{% else %}BACKUP{% endif %}
+
+              interface {{ keepalived_interface }}
+              virtual_router_id {{ keepalived_router_id }}
+              priority {{ haproxy_priority }}
+              authentication {
+                  auth_type PASS
+                  auth_pass {{ keepalived_auth_pass }}
+              }
+              virtual_ipaddress {
+                  {{ control_plane_vip }}
+              }
+              track_script {
+                  check_apiserver
+              }
+          }
+        mode: '0644'
+      notify: restart keepalived
+
+    - name: Create API server health check script
+      copy:
+        dest: /etc/keepalived/check_apiserver.sh
+        content: |
+          #!/bin/bash
+
+          errorExit() {
+              echo "*** $*" 1>&2
+              exit 1
+          }
+
+          # Check if HAProxy is running
+          systemctl is-active --quiet haproxy || errorExit "HAProxy is not running"
+
+          # Check if port {{ control_plane_port }} is listening
+          netstat -tuln | grep -q ":{{ control_plane_port }} " || errorExit "Port {{ control_plane_port }} is not listening"
+
+          # If we reach here, everything is OK
+          exit 0
+        mode: '0755'
+
+    - name: Enable and start Keepalived
+      systemd:
+        name: keepalived
+        enabled: yes
+        state: started
+
+    - name: Open ports for HAProxy stats (firewalld - RHEL)
+      firewalld:
+        port: "{{ haproxy_stats_port }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      when: ansible_os_family == "RedHat" and configure_firewall | bool
+
+    - name: Allow VRRP protocol (firewalld - RHEL)
+      firewalld:
+        rich_rule: 'rule protocol value="vrrp" accept'
+        permanent: yes
+        state: enabled
+        immediate: yes
+      when: ansible_os_family == "RedHat" and configure_firewall | bool
+
+    - name: Open ports for HAProxy stats (UFW - Ubuntu)
+      ufw:
+        rule: allow
+        port: "{{ haproxy_stats_port }}"
+        proto: tcp
+      when: ansible_os_family == "Debian" and configure_firewall | bool
+
+    - name: Allow VRRP protocol (UFW - Ubuntu)
+      ufw:
+        rule: allow
+        proto: vrrp
+      when: ansible_os_family == "Debian" and configure_firewall | bool
+
+  handlers:
+    - name: restart haproxy
+      systemd:
+        name: haproxy
+        state: restarted
+
+    - name: restart keepalived
+      systemd:
+        name: keepalived
+        state: restarted
+
+- name: Verify HAProxy and Keepalived
+  hosts: loadbalancer
+  become: yes
+  tasks:
+    - name: Wait for VIP to be assigned
+      wait_for:
+        host: "{{ control_plane_vip }}"
+        port: "{{ control_plane_port }}"
+        timeout: 60
+      run_once: true
+      delegate_to: localhost
+
+    - name: Check HAProxy status
+      command: systemctl status haproxy
+      register: haproxy_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check Keepalived status
+      command: systemctl status keepalived
+      register: keepalived_status
+      changed_when: false
+      failed_when: false
+
+    - name: Display HAProxy and Keepalived status
+      debug:
+        msg:
+          - "HAProxy: {{ 'Running' if 'active (running)' in haproxy_status.stdout else 'Not Running' }}"
+          - "Keepalived: {{ 'Running' if 'active (running)' in keepalived_status.stdout else 'Not Running' }}"
+
+    - name: Display VIP information
+      debug:
+        msg: "Control Plane VIP {{ control_plane_vip }}:{{ control_plane_port }} is ready"
+      run_once: true

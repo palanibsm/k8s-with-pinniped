@@ -1,0 +1,193 @@
+---
+- name: Initialize Kubernetes Control Plane on First Master
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Check if Kubernetes is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+
+    - name: Create kubeadm config file
+      copy:
+        dest: /tmp/kubeadm-config.yaml
+        content: |
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: InitConfiguration
+          localAPIEndpoint:
+            advertiseAddress: {{ node_ip }}
+            bindPort: {{ control_plane_port }}
+          nodeRegistration:
+            criSocket: unix:///run/containerd/containerd.sock
+            imagePullPolicy: IfNotPresent
+            name: {{ node_name }}
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          clusterName: kubernetes
+          kubernetesVersion: v{{ kubernetes_version }}.0
+          controlPlaneEndpoint: "{{ control_plane_vip }}:{{ control_plane_port }}"
+          networking:
+            podSubnet: {{ pod_network_cidr }}
+            serviceSubnet: {{ service_cidr }}
+            dnsDomain: {{ cluster_dns_domain }}
+          apiServer:
+            certSANs:
+              - "{{ control_plane_vip }}"
+              - "k8s-api"
+              - "k8s-api.{{ base_domain }}"
+          {% for host in groups['control_plane'] %}
+              - "{{ hostvars[host].node_name }}"
+              - "{{ hostvars[host].node_ip }}"
+          {% endfor %}
+            extraArgs:
+              authorization-mode: Node,RBAC
+          controllerManager:
+            extraArgs:
+              bind-address: 0.0.0.0
+          scheduler:
+            extraArgs:
+              bind-address: 0.0.0.0
+          etcd:
+            local:
+              dataDir: /var/lib/etcd
+          ---
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          cgroupDriver: systemd
+        mode: '0644'
+      when: not kubeadm_init.stat.exists
+
+    - name: Pull Kubernetes images
+      command: kubeadm config images pull
+      when: not kubeadm_init.stat.exists
+
+    - name: Initialize Kubernetes cluster
+      command: kubeadm init --config /tmp/kubeadm-config.yaml --upload-certs
+      register: kubeadm_init_output
+      when: not kubeadm_init.stat.exists
+
+    - name: Display kubeadm init output
+      debug:
+        var: kubeadm_init_output.stdout_lines
+      when: not kubeadm_init.stat.exists
+
+    - name: Create .kube directory for root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Copy admin.conf to root's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Create non-root user's .kube directory (if control_user is not root)
+      file:
+        path: "/home/{{ control_user }}/.kube"
+        state: directory
+        owner: "{{ control_user }}"
+        group: "{{ control_user }}"
+        mode: '0755'
+      when: control_user != "root"
+
+    - name: Copy admin.conf to non-root user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "/home/{{ control_user }}/.kube/config"
+        remote_src: yes
+        owner: "{{ control_user }}"
+        group: "{{ control_user }}"
+        mode: '0600'
+      when: control_user != "root"
+
+    - name: Generate join command for control plane nodes
+      command: kubeadm token create --print-join-command --certificate-key $(kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1)
+      register: join_command_control_plane
+      changed_when: false
+
+    - name: Generate join command for worker nodes
+      command: kubeadm token create --print-join-command
+      register: join_command_worker
+      changed_when: false
+
+    - name: Save control plane join command to local file
+      copy:
+        content: "{{ join_command_control_plane.stdout }}"
+        dest: /tmp/join-command-control-plane.sh
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+
+    - name: Save worker join command to local file
+      copy:
+        content: "{{ join_command_worker.stdout }}"
+        dest: /tmp/join-command-worker.sh
+        mode: '0755'
+      delegate_to: localhost
+      become: no
+
+    - name: Wait for all control plane components to be ready
+      command: kubectl get nodes
+      register: nodes_status
+      retries: 30
+      delay: 10
+      until: nodes_status.rc == 0
+      changed_when: false
+
+    - name: Display cluster status
+      command: kubectl get nodes
+      register: get_nodes
+      changed_when: false
+
+    - name: Show nodes
+      debug:
+        var: get_nodes.stdout_lines
+
+    - name: Display cluster info
+      command: kubectl cluster-info
+      register: cluster_info
+      changed_when: false
+
+    - name: Show cluster info
+      debug:
+        var: cluster_info.stdout_lines
+
+    - name: Taint control plane nodes to allow workloads (since they are also workers)
+      command: kubectl taint nodes {{ node_name }} node-role.kubernetes.io/control-plane:NoSchedule-
+      register: taint_result
+      failed_when: false
+      changed_when: "'untainted' in taint_result.stdout"
+
+    - name: Label control plane nodes as workers
+      command: kubectl label nodes {{ node_name }} node-role.kubernetes.io/worker=worker --overwrite
+      changed_when: false
+
+    - name: Fetch kubeconfig to local machine
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ playbook_dir }}/../configs/kubeconfig"
+        flat: yes
+
+    - name: Display important information
+      debug:
+        msg:
+          - "==========================================="
+          - "Kubernetes Control Plane Initialized!"
+          - "==========================================="
+          - "Kubeconfig saved to: {{ playbook_dir }}/../configs/kubeconfig"
+          - ""
+          - "To use kubectl from your local machine:"
+          - "export KUBECONFIG={{ playbook_dir }}/../configs/kubeconfig"
+          - ""
+          - "Join commands saved to:"
+          - "  - Control Plane: /tmp/join-command-control-plane.sh"
+          - "  - Workers: /tmp/join-command-worker.sh"
+          - ""
+          - "Next: Install CNI plugin (Cilium)"
+          - "==========================================="
