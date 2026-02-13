@@ -136,3 +136,24 @@ install_ingress: true
 install_metallb: true
 install_storage: true
 install_cilium_hubble: true
+install_pinniped: true
+
+# ====================
+# Pinniped Configuration
+# ====================
+pinniped_supervisor_version: "0.30.0"
+pinniped_concierge_version: "0.30.0"
+pinniped_supervisor_domain: "pinniped.emergingtechnation.com"
+pinniped_supervisor_namespace: "pinniped-supervisor"
+pinniped_concierge_namespace: "pinniped-concierge"
+
+# Azure AD Configuration
+# Note: Sensitive values (tenant_id, client_id, client_secret, group_ids)
+# should be stored in azure_ad_secrets.yml and encrypted with ansible-vault
+# See docs/AZURE-AD-CONFIGURATION.md for setup instructions
+
+# Azure AD Issuer URL (constructed from tenant_id)
+azure_ad_issuer_url: "https://login.microsoftonline.com/{{ azure_tenant_id }}/v2.0"
+
+# Pinniped CLI version for client authentication
+pinniped_cli_version: "0.30.0"

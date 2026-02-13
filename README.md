@@ -20,6 +20,7 @@ Production-ready Kubernetes cluster setup for 4 bare metal servers with high ava
 | **Storage** | Local Path Provisioner | Dynamic local volume provisioning |
 | **Ingress** | NGINX Ingress Controller | HTTP/HTTPS routing |
 | **Certificates** | cert-manager | Automatic TLS certificate management |
+| **Authentication** | Pinniped + Azure AD | Enterprise SSO and RBAC |
 | **Monitoring** | Prometheus + Grafana | Metrics and dashboards |
 | **Observability** | Cilium Hubble | Network observability |
 | **Registry** | Harbor | Private container registry |
@@ -47,7 +48,10 @@ k8s/
 │   │   ├── 11-ingress.yml         # NGINX Ingress
 │   │   ├── 12-cert-manager.yml    # cert-manager
 │   │   ├── 13-monitoring.yml      # Prometheus & Grafana
-│   │   └── 14-harbor.yml          # Harbor registry
+│   │   ├── 14-harbor.yml          # Harbor registry
+│   │   ├── 15-pinniped-supervisor.yml # Pinniped Supervisor (OIDC)
+│   │   ├── 16-pinniped-concierge.yml  # Pinniped Concierge (Auth)
+│   │   └── 17-pinniped-rbac.yml   # Azure AD RBAC mapping
 │   ├── roles/                     # Ansible roles (if needed)
 │   └── ansible.cfg                # Ansible configuration
 ├── configs/
@@ -55,15 +59,21 @@ k8s/
 │   ├── metallb/                   # MetalLB configurations
 │   ├── ingress/                   # Ingress configurations
 │   ├── monitoring/                # Monitoring configurations
-│   └── harbor/                    # Harbor configurations
+│   ├── harbor/                    # Harbor configurations
+│   └── pinniped/                  # Pinniped & Azure AD configs
 ├── docs/
 │   ├── INSTALLATION.md            # Step-by-step guide
 │   ├── ARCHITECTURE.md            # Detailed architecture
 │   ├── TROUBLESHOOTING.md         # Common issues
-│   └── POST-INSTALL.md            # Post-installation tasks
+│   ├── POST-INSTALL.md            # Post-installation tasks
+│   ├── AZURE-AD-CONFIGURATION.md  # Azure AD setup
+│   ├── PINNIPED-SETUP.md          # Pinniped integration
+│   └── USER-ONBOARDING.md         # User access guide
 └── scripts/
     ├── verify-prerequisites.sh    # Verify node requirements
-    └── health-check.sh            # Cluster health check
+    ├── health-check.sh            # Cluster health check
+    ├── install-pinniped-cli.sh    # Install Pinniped CLI
+    └── configure-pinniped-auth.sh # Configure kubectl auth
 ```
 
 ## 🚀 Quick Start

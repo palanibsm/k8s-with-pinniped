@@ -1,0 +1,401 @@
+---
+- name: Configure Kubernetes RBAC for Azure AD Groups
+  hosts: control_plane[0]
+  become: yes
+  vars_files:
+    - ../inventory/group_vars/azure_ad_secrets.yml
+  tasks:
+    - name: Validate Azure AD group IDs
+      assert:
+        that:
+          - azure_ad_group_ids.cluster_admins is defined
+          - azure_ad_group_ids.developers is defined
+          - azure_ad_group_ids.viewers is defined
+          - azure_ad_group_ids.namespace_owners is defined
+        fail_msg: "Azure AD group IDs not configured in azure_ad_secrets.yml"
+        success_msg: "Azure AD group IDs validated"
+
+    # ========================================
+    # Cluster Admins - Full Cluster Access
+    # ========================================
+    - name: Create ClusterRoleBinding for Cluster Admins
+      copy:
+        dest: /tmp/rbac-cluster-admins.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: azure-ad-cluster-admins
+            labels:
+              app: pinniped-rbac
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: cluster-admin
+          subjects:
+          - kind: Group
+            name: {{ azure_ad_group_ids.cluster_admins }}
+            apiGroup: rbac.authorization.k8s.io
+        mode: '0644'
+
+    - name: Apply Cluster Admins ClusterRoleBinding
+      command: kubectl apply -f /tmp/rbac-cluster-admins.yaml
+
+    # ========================================
+    # Developers - Application Management
+    # ========================================
+    - name: Create Developer ClusterRole
+      copy:
+        dest: /tmp/rbac-developer-role.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: developer
+            labels:
+              app: pinniped-rbac
+          rules:
+          # Deployments, ReplicaSets, Pods
+          - apiGroups: ["apps", ""]
+            resources: ["deployments", "replicasets", "pods", "pods/log", "pods/exec"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+          # Services, Ingress
+          - apiGroups: ["", "networking.k8s.io"]
+            resources: ["services", "ingresses", "endpoints"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+          # ConfigMaps, Secrets
+          - apiGroups: [""]
+            resources: ["configmaps", "secrets"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+          # PersistentVolumeClaims
+          - apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+          # Jobs, CronJobs
+          - apiGroups: ["batch"]
+            resources: ["jobs", "cronjobs"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+          # HorizontalPodAutoscalers
+          - apiGroups: ["autoscaling"]
+            resources: ["horizontalpodautoscalers"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+          # Read nodes (for debugging)
+          - apiGroups: [""]
+            resources: ["nodes"]
+            verbs: ["get", "list", "watch"]
+
+          # Read namespaces
+          - apiGroups: [""]
+            resources: ["namespaces"]
+            verbs: ["get", "list", "watch"]
+
+          # Read events
+          - apiGroups: [""]
+            resources: ["events"]
+            verbs: ["get", "list", "watch"]
+        mode: '0644'
+
+    - name: Apply Developer ClusterRole
+      command: kubectl apply -f /tmp/rbac-developer-role.yaml
+
+    - name: Create ClusterRoleBinding for Developers
+      copy:
+        dest: /tmp/rbac-developers.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: azure-ad-developers
+            labels:
+              app: pinniped-rbac
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: developer
+          subjects:
+          - kind: Group
+            name: {{ azure_ad_group_ids.developers }}
+            apiGroup: rbac.authorization.k8s.io
+        mode: '0644'
+
+    - name: Apply Developers ClusterRoleBinding
+      command: kubectl apply -f /tmp/rbac-developers.yaml
+
+    # ========================================
+    # Viewers - Read-Only Access
+    # ========================================
+    - name: Create ClusterRoleBinding for Viewers
+      copy:
+        dest: /tmp/rbac-viewers.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: azure-ad-viewers
+            labels:
+              app: pinniped-rbac
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: view  # Built-in view role
+          subjects:
+          - kind: Group
+            name: {{ azure_ad_group_ids.viewers }}
+            apiGroup: rbac.authorization.k8s.io
+        mode: '0644'
+
+    - name: Apply Viewers ClusterRoleBinding
+      command: kubectl apply -f /tmp/rbac-viewers.yaml
+
+    # ========================================
+    # Namespace Owners - Example Namespaces
+    # ========================================
+    - name: Create dev namespace (example)
+      command: kubectl create namespace dev
+      register: dev_ns
+      failed_when: false
+      changed_when: "'created' in dev_ns.stdout"
+
+    - name: Create staging namespace (example)
+      command: kubectl create namespace staging
+      register: staging_ns
+      failed_when: false
+      changed_when: "'created' in staging_ns.stdout"
+
+    - name: Create Namespace Admin Role (for namespace owners)
+      copy:
+        dest: /tmp/rbac-namespace-admin-role.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: namespace-admin
+            labels:
+              app: pinniped-rbac
+          rules:
+          # Full access to most resources in namespace
+          - apiGroups: ["", "apps", "batch", "networking.k8s.io", "autoscaling"]
+            resources: ["*"]
+            verbs: ["*"]
+
+          # Cannot modify ResourceQuotas or LimitRanges (set by platform team)
+          - apiGroups: [""]
+            resources: ["resourcequotas", "limitranges"]
+            verbs: ["get", "list", "watch"]
+        mode: '0644'
+
+    - name: Apply Namespace Admin ClusterRole
+      command: kubectl apply -f /tmp/rbac-namespace-admin-role.yaml
+
+    - name: Create RoleBinding for Namespace Owners in dev
+      copy:
+        dest: /tmp/rbac-namespace-owners-dev.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: azure-ad-namespace-owners
+            namespace: dev
+            labels:
+              app: pinniped-rbac
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: namespace-admin
+          subjects:
+          - kind: Group
+            name: {{ azure_ad_group_ids.namespace_owners }}
+            apiGroup: rbac.authorization.k8s.io
+        mode: '0644'
+
+    - name: Apply Namespace Owners RoleBinding in dev
+      command: kubectl apply -f /tmp/rbac-namespace-owners-dev.yaml
+
+    - name: Create RoleBinding for Namespace Owners in staging
+      copy:
+        dest: /tmp/rbac-namespace-owners-staging.yaml
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: azure-ad-namespace-owners
+            namespace: staging
+            labels:
+              app: pinniped-rbac
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: namespace-admin
+          subjects:
+          - kind: Group
+            name: {{ azure_ad_group_ids.namespace_owners }}
+            apiGroup: rbac.authorization.k8s.io
+        mode: '0644'
+
+    - name: Apply Namespace Owners RoleBinding in staging
+      command: kubectl apply -f /tmp/rbac-namespace-owners-staging.yaml
+
+    # ========================================
+    # Verification
+    # ========================================
+    - name: Get all ClusterRoleBindings for Azure AD
+      command: kubectl get clusterrolebinding -l app=pinniped-rbac
+      register: crb_list
+      changed_when: false
+
+    - name: Display ClusterRoleBindings
+      debug:
+        var: crb_list.stdout_lines
+
+    - name: Get RoleBindings in dev namespace
+      command: kubectl get rolebinding -n dev -l app=pinniped-rbac
+      register: rb_dev
+      changed_when: false
+
+    - name: Display RoleBindings in dev
+      debug:
+        var: rb_dev.stdout_lines
+
+    - name: Save RBAC configurations
+      fetch:
+        src: "{{ item }}"
+        dest: "{{ playbook_dir }}/../configs/pinniped/rbac/"
+        flat: yes
+      loop:
+        - /tmp/rbac-cluster-admins.yaml
+        - /tmp/rbac-developer-role.yaml
+        - /tmp/rbac-developers.yaml
+        - /tmp/rbac-viewers.yaml
+        - /tmp/rbac-namespace-admin-role.yaml
+        - /tmp/rbac-namespace-owners-dev.yaml
+        - /tmp/rbac-namespace-owners-staging.yaml
+
+    - name: Create RBAC summary document
+      copy:
+        dest: /tmp/rbac-summary.md
+        content: |
+          # Kubernetes RBAC Configuration Summary
+
+          ## Azure AD Group Mappings
+
+          | Azure AD Group | Group ID | Kubernetes Role | Access Level |
+          |----------------|----------|-----------------|--------------|
+          | k8s-cluster-admins | {{ azure_ad_group_ids.cluster_admins }} | cluster-admin | Full cluster access |
+          | k8s-developers | {{ azure_ad_group_ids.developers }} | developer (custom) | Manage apps, services, config |
+          | k8s-viewers | {{ azure_ad_group_ids.viewers }} | view (built-in) | Read-only cluster access |
+          | k8s-namespace-owners | {{ azure_ad_group_ids.namespace_owners }} | namespace-admin (custom) | Full access in dev/staging |
+
+          ## Permission Details
+
+          ### Cluster Admins
+          - **Role**: cluster-admin (built-in)
+          - **Access**: Full administrative access to all cluster resources
+          - **Scope**: Cluster-wide
+          - **Use case**: Platform administrators, SRE team
+
+          ### Developers
+          - **Role**: developer (custom ClusterRole)
+          - **Permissions**:
+            - Create/manage: Deployments, Services, Ingress, ConfigMaps, Secrets, PVCs
+            - Create/manage: Jobs, CronJobs, HPA
+            - Read: Nodes, Namespaces, Events
+            - Cannot: Delete namespaces, modify RBAC, access kube-system
+          - **Scope**: Cluster-wide (but restricted resources)
+          - **Use case**: Application developers, DevOps engineers
+
+          ### Viewers
+          - **Role**: view (built-in)
+          - **Permissions**: Read-only access to most resources
+          - **Scope**: Cluster-wide
+          - **Use case**: Monitoring, auditing, support staff
+
+          ### Namespace Owners
+          - **Role**: namespace-admin (custom ClusterRole)
+          - **Permissions**:
+            - Full control over resources in assigned namespaces
+            - Cannot modify ResourceQuotas or LimitRanges
+          - **Scope**: Namespace-specific (currently: dev, staging)
+          - **Use case**: Team leads, namespace administrators
+
+          ## Adding Users to Groups
+
+          1. Go to Azure Portal → Azure Active Directory → Groups
+          2. Select the appropriate group (e.g., k8s-developers)
+          3. Click "Members" → "Add members"
+          4. Search and add user
+          5. User will have permissions on next kubectl authentication
+
+          ## Testing Access
+
+          After user authenticates with Azure AD, test their access:
+
+          ```bash
+          # Test as cluster admin
+          kubectl get nodes
+          kubectl get pods -A
+          kubectl create namespace test
+
+          # Test as developer
+          kubectl get pods
+          kubectl create deployment test --image=nginx
+          kubectl get nodes  # Should work (read-only)
+          kubectl delete namespace test  # Should fail
+
+          # Test as viewer
+          kubectl get pods
+          kubectl get deployments
+          kubectl delete deployment test  # Should fail
+          ```
+
+          ## Troubleshooting
+
+          ### User has no permissions after authentication
+          - Verify user is member of Azure AD group
+          - Check group Object ID matches configuration
+          - Verify ClusterRoleBinding exists: `kubectl get clusterrolebinding -l app=pinniped-rbac`
+          - Check user's groups in JWT token
+
+          ### How to check user's effective permissions
+          ```bash
+          kubectl auth can-i --list --as=user@example.com
+          kubectl auth can-i create deployments --as=user@example.com
+          ```
+        mode: '0644'
+
+    - name: Save RBAC summary
+      fetch:
+        src: /tmp/rbac-summary.md
+        dest: "{{ playbook_dir }}/../configs/pinniped/RBAC-SUMMARY.md"
+        flat: yes
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "RBAC Configuration Complete!"
+          - "==========================================="
+          - "Azure AD Groups Configured:"
+          - "  - Cluster Admins ({{ azure_ad_group_ids.cluster_admins }})"
+          - "  - Developers ({{ azure_ad_group_ids.developers }})"
+          - "  - Viewers ({{ azure_ad_group_ids.viewers }})"
+          - "  - Namespace Owners ({{ azure_ad_group_ids.namespace_owners }})"
+          - ""
+          - "Namespaces Created:"
+          - "  - dev (namespace-admin access)"
+          - "  - staging (namespace-admin access)"
+          - ""
+          - "RBAC Configurations saved to: configs/pinniped/rbac/"
+          - "RBAC Summary saved to: configs/pinniped/RBAC-SUMMARY.md"
+          - ""
+          - "Next Steps:"
+          - "1. Add users to Azure AD groups"
+          - "2. Install Pinniped CLI on client machines"
+          - "3. Configure user kubeconfigs"
+          - "4. Test authentication and permissions"
+          - "==========================================="

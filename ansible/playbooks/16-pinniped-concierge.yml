@@ -1,0 +1,190 @@
+---
+- name: Install Pinniped Concierge for Cluster Authentication
+  hosts: control_plane[0]
+  become: yes
+  tasks:
+    - name: Check if Pinniped is enabled
+      assert:
+        that: install_pinniped | bool
+        fail_msg: "Pinniped installation is disabled"
+        success_msg: "Pinniped installation is enabled"
+
+    - name: Check if Pinniped Concierge namespace exists
+      command: kubectl get namespace {{ pinniped_concierge_namespace }}
+      register: concierge_ns
+      changed_when: false
+      failed_when: false
+
+    - name: Create Pinniped Concierge namespace
+      command: kubectl create namespace {{ pinniped_concierge_namespace }}
+      when: concierge_ns.rc != 0
+
+    - name: Download Pinniped Concierge installation manifest
+      get_url:
+        url: "https://get.pinniped.dev/v{{ pinniped_concierge_version }}/install-pinniped-concierge-crds.yaml"
+        dest: /tmp/install-pinniped-concierge-crds.yaml
+        mode: '0644'
+
+    - name: Apply Pinniped Concierge CRDs
+      command: kubectl apply -f /tmp/install-pinniped-concierge-crds.yaml
+
+    - name: Download Pinniped Concierge resources
+      get_url:
+        url: "https://get.pinniped.dev/v{{ pinniped_concierge_version }}/install-pinniped-concierge-resources.yaml"
+        dest: /tmp/install-pinniped-concierge-resources.yaml
+        mode: '0644'
+
+    - name: Apply Pinniped Concierge resources
+      command: kubectl apply -f /tmp/install-pinniped-concierge-resources.yaml
+
+    - name: Wait for Pinniped Concierge to be ready
+      command: kubectl wait --for=condition=ready pod -l app={{ pinniped_concierge_namespace }} -n {{ pinniped_concierge_namespace }} --timeout=300s
+      register: concierge_ready
+      retries: 3
+      delay: 10
+      until: concierge_ready.rc == 0
+
+    - name: Get Supervisor FederationDomain discovery info
+      shell: |
+        kubectl get federationdomain kubernetes-federation \
+          -n {{ pinniped_supervisor_namespace }} \
+          -o jsonpath='{.status.phase}'
+      register: federation_phase
+      retries: 10
+      delay: 5
+      until: federation_phase.stdout == "Ready"
+      changed_when: false
+
+    - name: Create JWTAuthenticator configuration
+      copy:
+        dest: /tmp/pinniped-jwt-authenticator.yaml
+        content: |
+          apiVersion: authentication.concierge.pinniped.dev/v1alpha1
+          kind: JWTAuthenticator
+          metadata:
+            name: kubernetes-jwt-authenticator
+            namespace: {{ pinniped_concierge_namespace }}
+          spec:
+            issuer: https://{{ pinniped_supervisor_domain }}
+            audience: kubernetes
+            tls:
+              certificateAuthorityData: ""  # Will use system CA bundle
+            claims:
+              username: email
+              groups: groups
+        mode: '0644'
+
+    - name: Apply JWTAuthenticator
+      command: kubectl apply -f /tmp/pinniped-jwt-authenticator.yaml
+
+    - name: Wait for JWTAuthenticator to be ready
+      shell: kubectl get jwtauthenticator kubernetes-jwt-authenticator -n {{ pinniped_concierge_namespace }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: jwt_ready
+      retries: 30
+      delay: 5
+      until: jwt_ready.stdout == "True"
+      changed_when: false
+
+    - name: Get cluster info for kubeconfig generation
+      shell: kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.server}'
+      register: cluster_server
+      changed_when: false
+
+    - name: Get cluster CA certificate
+      shell: kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}'
+      register: cluster_ca
+      changed_when: false
+
+    - name: Create Pinniped kubeconfig template
+      copy:
+        dest: /tmp/pinniped-kubeconfig.yaml
+        content: |
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              certificate-authority-data: {{ cluster_ca.stdout }}
+              server: {{ cluster_server.stdout }}
+            name: kubernetes-cluster
+          contexts:
+          - context:
+              cluster: kubernetes-cluster
+              user: pinniped-user
+            name: pinniped-context
+          current-context: pinniped-context
+          users:
+          - name: pinniped-user
+            user:
+              exec:
+                apiVersion: client.authentication.k8s.io/v1beta1
+                command: pinniped
+                args:
+                - login
+                - oidc
+                - --issuer=https://{{ pinniped_supervisor_domain }}
+                - --client-id={{ azure_client_id | default('kubernetes') }}
+                - --scopes=openid,email,profile,groups,offline_access
+                - --ca-bundle-data={{ cluster_ca.stdout }}
+                - --request-audience=kubernetes
+        mode: '0644'
+      when: azure_client_id is defined
+
+    - name: Save kubeconfig template
+      fetch:
+        src: /tmp/pinniped-kubeconfig.yaml
+        dest: "{{ playbook_dir }}/../configs/pinniped/kubeconfig-template.yaml"
+        flat: yes
+      when: azure_client_id is defined
+
+    - name: Get Pinniped Concierge pods
+      command: kubectl get pods -n {{ pinniped_concierge_namespace }}
+      register: concierge_pods
+      changed_when: false
+
+    - name: Display Concierge pods
+      debug:
+        var: concierge_pods.stdout_lines
+
+    - name: Get JWTAuthenticator status
+      command: kubectl get jwtauthenticator -n {{ pinniped_concierge_namespace }}
+      register: jwt_status
+      changed_when: false
+
+    - name: Display JWTAuthenticator status
+      debug:
+        var: jwt_status.stdout_lines
+
+    - name: Get Concierge CredentialIssuer status
+      command: kubectl get credentialissuer -A
+      register: credentialissuer_status
+      changed_when: false
+
+    - name: Display CredentialIssuer status
+      debug:
+        var: credentialissuer_status.stdout_lines
+
+    - name: Save Pinniped Concierge configurations
+      fetch:
+        src: /tmp/pinniped-jwt-authenticator.yaml
+        dest: "{{ playbook_dir }}/../configs/pinniped/jwt-authenticator.yaml"
+        flat: yes
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "Pinniped Concierge Installed Successfully!"
+          - "==========================================="
+          - "Namespace: {{ pinniped_concierge_namespace }}"
+          - "JWT Authenticator: kubernetes-jwt-authenticator"
+          - ""
+          - "Concierge is now integrated with Supervisor"
+          - "Users can authenticate via Azure AD"
+          - ""
+          - "Next Steps:"
+          - "1. Configure RBAC: ansible-playbook playbooks/17-pinniped-rbac.yml"
+          - "2. Install Pinniped CLI on client machines"
+          - "3. Configure user kubeconfigs"
+          - ""
+          - "Kubeconfig template saved to: configs/pinniped/kubeconfig-template.yaml"
+          - "==========================================="

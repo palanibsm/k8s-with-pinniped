@@ -1,0 +1,216 @@
+---
+- name: Install Pinniped Supervisor for Azure AD Authentication
+  hosts: control_plane[0]
+  become: yes
+  vars_files:
+    - ../inventory/group_vars/azure_ad_secrets.yml
+  tasks:
+    - name: Check if Pinniped is enabled
+      assert:
+        that: install_pinniped | bool
+        fail_msg: "Pinniped installation is disabled. Set install_pinniped: true in all.yml"
+        success_msg: "Pinniped installation is enabled"
+
+    - name: Validate Azure AD configuration
+      assert:
+        that:
+          - azure_tenant_id is defined
+          - azure_client_id is defined
+          - azure_client_secret is defined
+          - azure_ad_group_ids.cluster_admins is defined
+        fail_msg: "Azure AD configuration missing. Please configure azure_ad_secrets.yml"
+        success_msg: "Azure AD configuration validated"
+
+    - name: Check if Pinniped Supervisor namespace exists
+      command: kubectl get namespace {{ pinniped_supervisor_namespace }}
+      register: supervisor_ns
+      changed_when: false
+      failed_when: false
+
+    - name: Create Pinniped Supervisor namespace
+      command: kubectl create namespace {{ pinniped_supervisor_namespace }}
+      when: supervisor_ns.rc != 0
+
+    - name: Download Pinniped installation manifest
+      get_url:
+        url: "https://get.pinniped.dev/v{{ pinniped_supervisor_version }}/install-pinniped-supervisor.yaml"
+        dest: /tmp/install-pinniped-supervisor.yaml
+        mode: '0644'
+
+    - name: Apply Pinniped Supervisor installation
+      command: kubectl apply -f /tmp/install-pinniped-supervisor.yaml
+      register: supervisor_install
+
+    - name: Wait for Pinniped Supervisor to be ready
+      command: kubectl wait --for=condition=ready pod -l app={{ pinniped_supervisor_namespace }} -n {{ pinniped_supervisor_namespace }} --timeout=300s
+      register: supervisor_ready
+      retries: 3
+      delay: 10
+      until: supervisor_ready.rc == 0
+
+    - name: Create Azure AD client secret in Kubernetes
+      shell: |
+        kubectl create secret generic azure-ad-client-secret \
+          --from-literal=clientSecret="{{ azure_client_secret }}" \
+          -n {{ pinniped_supervisor_namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      no_log: true  # Don't log the secret
+
+    - name: Create FederationDomain configuration
+      copy:
+        dest: /tmp/pinniped-federation-domain.yaml
+        content: |
+          apiVersion: config.supervisor.pinniped.dev/v1alpha1
+          kind: FederationDomain
+          metadata:
+            name: kubernetes-federation
+            namespace: {{ pinniped_supervisor_namespace }}
+          spec:
+            issuer: https://{{ pinniped_supervisor_domain }}
+            tls:
+              secretName: pinniped-supervisor-tls
+        mode: '0644'
+
+    - name: Apply FederationDomain
+      command: kubectl apply -f /tmp/pinniped-federation-domain.yaml
+
+    - name: Create OIDCIdentityProvider configuration
+      copy:
+        dest: /tmp/pinniped-oidc-provider.yaml
+        content: |
+          apiVersion: idp.supervisor.pinniped.dev/v1alpha1
+          kind: OIDCIdentityProvider
+          metadata:
+            name: azure-ad
+            namespace: {{ pinniped_supervisor_namespace }}
+          spec:
+            issuer: {{ azure_ad_issuer_url }}
+            client:
+              secretName: azure-ad-client-secret
+            claims:
+              username: email
+              groups: groups
+            authorizationConfig:
+              additionalScopes:
+                - email
+                - profile
+                - openid
+              allowPasswordGrant: false
+        mode: '0644'
+
+    - name: Apply OIDCIdentityProvider
+      command: kubectl apply -f /tmp/pinniped-oidc-provider.yaml
+
+    - name: Create Ingress for Pinniped Supervisor
+      copy:
+        dest: /tmp/pinniped-supervisor-ingress.yaml
+        content: |
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: pinniped-supervisor
+            namespace: {{ pinniped_supervisor_namespace }}
+            annotations:
+              cert-manager.io/cluster-issuer: "letsencrypt-prod"
+              nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - {{ pinniped_supervisor_domain }}
+              secretName: pinniped-supervisor-tls
+            rules:
+            - host: {{ pinniped_supervisor_domain }}
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: pinniped-supervisor
+                      port:
+                        number: 8443
+        mode: '0644'
+
+    - name: Apply Ingress for Pinniped Supervisor
+      command: kubectl apply -f /tmp/pinniped-supervisor-ingress.yaml
+
+    - name: Wait for TLS certificate to be issued
+      shell: kubectl get certificate pinniped-supervisor-tls -n {{ pinniped_supervisor_namespace }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: cert_ready
+      retries: 60
+      delay: 10
+      until: cert_ready.stdout == "True"
+      changed_when: false
+
+    - name: Get Pinniped Supervisor pods
+      command: kubectl get pods -n {{ pinniped_supervisor_namespace }}
+      register: supervisor_pods
+      changed_when: false
+
+    - name: Display Supervisor pods
+      debug:
+        var: supervisor_pods.stdout_lines
+
+    - name: Get FederationDomain status
+      command: kubectl get federationdomain -n {{ pinniped_supervisor_namespace }}
+      register: federation_status
+      changed_when: false
+
+    - name: Display FederationDomain status
+      debug:
+        var: federation_status.stdout_lines
+
+    - name: Get OIDCIdentityProvider status
+      command: kubectl get oidcidentityprovider -n {{ pinniped_supervisor_namespace }}
+      register: oidc_status
+      changed_when: false
+
+    - name: Display OIDCIdentityProvider status
+      debug:
+        var: oidc_status.stdout_lines
+
+    - name: Save Pinniped Supervisor configurations
+      fetch:
+        src: "{{ item }}"
+        dest: "{{ playbook_dir }}/../configs/pinniped/"
+        flat: yes
+      loop:
+        - /tmp/pinniped-federation-domain.yaml
+        - /tmp/pinniped-oidc-provider.yaml
+        - /tmp/pinniped-supervisor-ingress.yaml
+
+    - name: Test Supervisor OIDC discovery endpoint
+      uri:
+        url: "https://{{ pinniped_supervisor_domain }}/.well-known/openid-configuration"
+        return_content: yes
+        validate_certs: yes
+      register: oidc_discovery
+      retries: 10
+      delay: 5
+      until: oidc_discovery.status == 200
+      failed_when: false
+
+    - name: Display OIDC discovery result
+      debug:
+        msg: "OIDC discovery endpoint: {{ 'Available' if oidc_discovery.status == 200 else 'Not yet available (may need DNS propagation)' }}"
+
+    - name: Display success message
+      debug:
+        msg:
+          - "==========================================="
+          - "Pinniped Supervisor Installed Successfully!"
+          - "==========================================="
+          - "Supervisor Domain: https://{{ pinniped_supervisor_domain }}"
+          - "Namespace: {{ pinniped_supervisor_namespace }}"
+          - "Azure AD Tenant: {{ azure_tenant_id }}"
+          - ""
+          - "IMPORTANT: Ensure DNS is configured:"
+          - "  {{ pinniped_supervisor_domain }} → <INGRESS_IP>"
+          - ""
+          - "Next Steps:"
+          - "1. Verify DNS: nslookup {{ pinniped_supervisor_domain }}"
+          - "2. Test OIDC: curl https://{{ pinniped_supervisor_domain }}/.well-known/openid-configuration"
+          - "3. Install Concierge: ansible-playbook playbooks/16-pinniped-concierge.yml"
+          - "==========================================="
